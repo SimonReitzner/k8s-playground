@@ -1,0 +1,209 @@
+require 'yaml'
+
+# Load configuration from YAML file
+config_file = YAML.load_file('config.yaml')
+master_config = config_file['nodes']['master']
+worker_config = config_file['nodes']['worker']
+pod_network_cidr = config_file['network']['pod_network_cidr']
+private_network_cidr = config_file['network']['private_network_cidr']
+
+# Function to handle provisioning tasks for master node
+def provision_master_node(vm_name, ip_address, worker_name, pod_network_cidr, private_network_cidr)
+  <<-SHELL
+
+    # Set frontend to noninteractive to avoid dpkg stdin warning
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Add localhost entry
+    if ! grep -q "127.0.0.1\s\+#{vm_name}" /etc/hosts; then
+      echo "127.0.0.1    #{vm_name}" | sudo tee -a /etc/hosts > /dev/null
+      echo "Added localhost entry for #{vm_name}"
+    else
+      echo "Localhost entry for #{vm_name} already exists."
+    fi
+
+    # Add private IP entry
+    if ! grep -q "#{ip_address}\s\+#{vm_name}" /etc/hosts; then
+      echo "#{ip_address}    #{vm_name}" | sudo tee -a /etc/hosts > /dev/null
+      echo "Added private IP entry for #{vm_name}"
+    else
+      echo "Private IP entry for #{vm_name} already exists."
+    fi
+
+    # Turn off swap
+    sudo swapoff -a
+    
+    # Make the swapoff permanent by commenting out the swap entry in /etc/fstab
+    sudo sed -i '/ swap / s/^/#/' /etc/fstab
+
+    # If the directory `/etc/apt/keyrings` does not exist, it should be created before the curl command
+    sudo mkdir -p -m 755 /etc/apt/keyrings
+
+    # Install containerd (as the container runtime)
+    sudo apt-get update && sudo apt-get install -y containerd
+
+    # Configure containerd
+    sudo mkdir -p /etc/containerd
+    sudo containerd config default | sudo tee /etc/containerd/config.toml
+
+    # Update containerd configuration to use the correct pause image
+    sudo sed -i 's|sandbox_image =.*|sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
+
+    # Restart containerd to apply the new configuration
+    sudo systemctl restart containerd
+    sudo systemctl enable containerd
+  
+    # Install kubeadm, kubelet, and kubectl
+    sudo apt-get install -y apt-transport-https ca-certificates curl gpg socat
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+    sudo apt-get update
+    sudo apt-get install -y kubelet kubeadm kubectl
+    sudo apt-mark hold kubelet kubeadm kubectl
+
+    # Enable the kubelet service
+    sudo systemctl enable --now kubelet
+
+    # Ensure IP forwarding is enabled
+    if grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+        echo "IP forwarding is already enabled."
+    else
+        echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+        sudo sysctl -p
+    fi
+
+    # Initialize the Kubernetes cluster on the master node
+    sudo kubeadm init \
+      --apiserver-advertise-address=#{ip_address} \
+      --pod-network-cidr=#{pod_network_cidr} \
+      --node-name=#{vm_name}
+    
+    # Setup kubeconfig for the vagrant user
+    mkdir -p /home/vagrant/.kube
+    sudo cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+    sudo chown vagrant:vagrant /home/vagrant/.kube/config
+
+    # Install the Pod network (flannel)
+    sudo su - vagrant -c 'kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml'
+
+    # Set up master node as NFS server
+    sudo apt-get install -y nfs-kernel-server
+    sudo mkdir -p /.vagrant_shared
+    echo "/.vagrant_shared #{private_network_cidr}(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+    sudo exportfs -a
+    sudo systemctl restart nfs-kernel-server
+
+    # Generate and save the kubeadm join command
+    kubeadm_join_command=$(kubeadm token create --print-join-command)
+    sudo echo "$kubeadm_join_command --node-name #{worker_name}" > /.vagrant_shared/kubeadm_join_cmd.sh
+
+    # Change ownership of shared folder and permissions
+    sudo chown -R nobody:nogroup /.vagrant_shared
+    sudo chmod 755 /.vagrant_shared
+
+  SHELL
+end
+
+# Function to handle provisioning tasks for worker node
+def provision_worker_node(vm_name, ip_address, master_ip)
+  <<-SHELL
+
+    # Set frontend to noninteractive to avoid dpkg stdin warning
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Add localhost entry
+    if ! grep -q "127.0.0.1\s\+#{vm_name}" /etc/hosts; then
+      echo "127.0.0.1    #{vm_name}" | sudo tee -a /etc/hosts > /dev/null
+      echo "Added localhost entry for #{vm_name}"
+    else
+      echo "Localhost entry for #{vm_name} already exists."
+    fi
+
+    # Add private IP entry
+    if ! grep -q "#{ip_address}\s\+#{vm_name}" /etc/hosts; then
+      echo "#{ip_address}    #{vm_name}" | sudo tee -a /etc/hosts > /dev/nul
+      echo "Added private IP entry for #{vm_name}"
+    else
+      echo "Private IP entry for #{vm_name} already exists."
+    fi
+
+    # Turn off swap
+    sudo swapoff -a
+    
+    # Make the swapoff permanent by commenting out the swap entry in /etc/fstab
+    sudo sed -i '/ swap / s/^/#/' /etc/fstab
+
+    # If the directory `/etc/apt/keyrings` does not exist, it should be created before the curl command
+    sudo mkdir -p -m 755 /etc/apt/keyrings
+
+    # Install containerd (as the container runtime)
+    sudo apt-get update && sudo apt-get install -y containerd
+
+    # Configure containerd
+    sudo mkdir -p /etc/containerd
+    sudo containerd config default | sudo tee /etc/containerd/config.toml
+
+    # Update containerd configuration to use the correct pause image
+    sudo sed -i 's|sandbox_image =.*|sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
+
+    # Restart containerd to apply the new configuration
+    sudo systemctl restart containerd
+    sudo systemctl enable containerd
+  
+    # Install kubeadm, kubelet, and kubectl
+    sudo apt-get install -y apt-transport-https ca-certificates curl gpg socat
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+    sudo apt-get update
+    sudo apt-get install -y kubelet kubeadm kubectl
+    sudo apt-mark hold kubelet kubeadm kubectl
+
+    # Enable the kubelet service
+    sudo systemctl enable --now kubelet
+
+    # Ensure IP forwarding is enabled
+    if grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf; then
+        echo "IP forwarding is already enabled."
+    else
+        echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+        sudo sysctl -p
+    fi
+
+    # Set up worker node to mount the NFS shared folder from the master node
+    sudo apt-get install -y nfs-common
+    sudo mkdir -p /.vagrant_shared
+    sudo mount #{master_ip}:/.vagrant_shared /.vagrant_shared
+
+    # Join the worker node to the Kubernetes cluster using the join command generated on the master node
+    sudo bash /.vagrant_shared/kubeadm_join_cmd.sh
+
+  SHELL
+end
+
+Vagrant.configure("2") do |config|
+  # VM 1: Master node
+  config.vm.define master_config['name'] do |master|
+    master.vm.box = "ubuntu/bionic64"
+    master.vm.network "private_network", ip: master_config['ip']
+    master.vm.provider "virtualbox" do |vb|
+      vb.memory = master_config['memory']
+      vb.cpus = master_config['cpus']
+    end
+    master.vm.synced_folder ".", "/vagrant", disabled: true
+    master.vm.provision "shell", inline: provision_master_node(master_config['name'], master_config['ip'], worker_config['name'], pod_network_cidr, private_network_cidr)
+  end
+
+  # VM 2: Worker node
+  config.vm.define worker_config['name'] do |worker|
+    worker.vm.box = "ubuntu/bionic64"
+    worker.vm.network "private_network", ip: worker_config['ip']
+    worker.vm.provider "virtualbox" do |vb|
+      vb.memory = worker_config['memory']
+      vb.cpus = worker_config['cpus']
+    end
+    worker.vm.synced_folder ".", "/vagrant", disabled: true
+    worker.vm.provision "shell", inline: provision_worker_node(worker_config['name'], worker_config['ip'], master_config['ip'])
+  end
+end

@@ -1,0 +1,16 @@
+nodes:
+  master:
+    name: "k8s-master"
+    ip: "192.168.56.21"
+    memory: 2048
+    cpus: 2
+    identity_file: "./.vagrant/machines/k8s-master/virtualbox/private_key"
+  worker:
+    name: "k8s-worker"
+    ip: "192.168.56.22"
+    memory: 2048
+    cpus: 2
+    identity_file: "./.vagrant/machines/k8s-worker/virtualbox/private_key"
+network:
+  pod_network_cidr: "10.244.0.0/16"
+  private_network_cidr: "192.168.56.0/24"
